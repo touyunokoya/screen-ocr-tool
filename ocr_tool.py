@@ -7,7 +7,7 @@
 終了するときは、画面右下のタスクトレイのアイコンを右クリック →「終了」
 """
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 # ============ 設定(ここを書き換えると動作を変えられます) ============
 HOTKEY_TEXT = "ctrl+shift+x"    # 文章認識のショートカットキー
@@ -431,6 +431,7 @@ class RegionSelector:
         self.screenshot = screenshot
         self.start = None
         self.rect_id = None
+        self.finished = False
 
         self.top = tk.Toplevel(root)
         self.top.overrideredirect(True)
@@ -451,9 +452,27 @@ class RegionSelector:
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
-        self.canvas.bind("<ButtonPress-3>", lambda e: self.cancel())
-        self.top.bind("<Escape>", lambda e: self.cancel())
+        self.canvas.bind("<ButtonPress-3>", lambda e: self.finish(None))
+        self.top.bind("<Escape>", lambda e: self.finish(None))
+        # 何らかの理由でウィンドウが外部から閉じられても「選択中」のまま残らないようにする
+        self.top.bind("<Destroy>", self._on_destroy)
         self.top.focus_force()
+
+    def finish(self, crop):
+        """結果を一度だけ通知してウィンドウを閉じる(多重呼び出し・異常終了に安全)"""
+        if self.finished:
+            return
+        self.finished = True
+        try:
+            if self.top.winfo_exists():
+                self.top.destroy()
+        except tk.TclError:
+            pass
+        self.on_done(crop)
+
+    def _on_destroy(self, e):
+        if e.widget is self.top:
+            self.finish(None)
 
     def on_press(self, e):
         self.start = (e.x, e.y)
@@ -474,16 +493,11 @@ class RegionSelector:
         x1, y1 = e.x, e.y
         left, top = min(x0, x1), min(y0, y1)
         right, bottom = max(x0, x1), max(y0, y1)
-        self.top.destroy()
         if right - left < 8 or bottom - top < 8:
-            self.on_done(None)
+            self.finish(None)
             return
         crop = self.screenshot.crop((left, top, right, bottom))
-        self.on_done(crop)
-
-    def cancel(self):
-        self.top.destroy()
-        self.on_done(None)
+        self.finish(crop)
 
 
 # ---- 通知トースト ----
@@ -577,21 +591,30 @@ def main():
         if state["selecting"]:
             return
         state["selecting"] = True
-        with mss.mss() as sct:
-            mon = sct.monitors[0]  # 全モニタをまとめた仮想画面
-            shot = sct.grab(mon)
-            screenshot = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-            vx, vy = mon["left"], mon["top"]
+        try:
+            with mss.mss() as sct:
+                mon = sct.monitors[0]  # 全モニタをまとめた仮想画面
+                shot = sct.grab(mon)
+                screenshot = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                vx, vy = mon["left"], mon["top"]
 
-        def on_done(crop):
+            def on_done(crop):
+                state["selecting"] = False
+                if crop is not None:
+                    threading.Thread(target=process_capture,
+                                     args=(crop, mode), daemon=True).start()
+
+            RegionSelector(root, screenshot, vx, vy, on_done)
+        except Exception:
+            # スリープ復帰直後などは画面の取得に失敗することがある。
+            # 失敗したまま「選択中」フラグが残ると全キーが死ぬので必ず戻す
             state["selecting"] = False
-            if crop is not None:
-                threading.Thread(target=process_capture,
-                                 args=(crop, mode), daemon=True).start()
-
-        RegionSelector(root, screenshot, vx, vy, on_done)
+            log("start_capture failed:\n" + traceback.format_exc())
+            ui_queue.put(("toast", "画面の取得に失敗しました。もう一度キーを押してください"))
 
     def poll():
+        # このループが止まると全ホットキーが無反応になるため、
+        # どんなエラーが起きても必ず次回の実行を予約し直す
         try:
             while True:
                 kind, payload = ui_queue.get_nowait()
@@ -606,6 +629,9 @@ def main():
                     os._exit(0)
         except queue.Empty:
             pass
+        except Exception:
+            log("poll error:\n" + traceback.format_exc())
+            state["selecting"] = False  # 引っかかったままにならないよう解除
         root.after(80, poll)
 
     poll()
