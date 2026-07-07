@@ -7,7 +7,7 @@
 終了するときは、画面右下のタスクトレイのアイコンを右クリック →「終了」
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # ============ 設定(ここを書き換えると動作を変えられます) ============
 HOTKEY_TEXT = "ctrl+shift+x"    # 文章認識のショートカットキー
@@ -407,6 +407,67 @@ def recognize_math_surya(img):
     return html.unescape("\n".join(parts).strip())
 
 
+# ---- PDF丸ごと変換(Marker、別環境のサブプロセスとして実行) ----
+# 本体のsurya 0.17と依存が衝突しないよう、専用venvに入れたmarkerを外部コマンドで呼ぶ
+pdf_converting = threading.Lock()
+
+
+def find_marker():
+    """Marker環境のmarker_single.exeを探す。無ければNone(機能は自動で無効化される)"""
+    candidates = [
+        r"C:\Tools\marker_venv",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "ocr-tool", "marker_venv"),
+    ]
+    for venv in candidates:
+        exe = os.path.join(venv, "Scripts", "marker_single.exe")
+        if os.path.isfile(exe):
+            return exe
+    return None
+
+
+def convert_pdf(pdf_path):
+    """PDFをMarkdown(数式はLaTeX)に変換する。ワーカースレッドで実行"""
+    import subprocess
+    exe = find_marker()
+    if exe is None:
+        ui_queue.put(("toast",
+                      "PDF変換の部品が見つかりません。\n"
+                      "セットアップ(marker環境の構築)が必要です"))
+        return
+    if not pdf_converting.acquire(blocking=False):
+        ui_queue.put(("toast", "別のPDFを変換中です。完了までお待ちください"))
+        return
+    try:
+        out_dir = os.path.join(os.path.dirname(pdf_path),
+                               os.path.splitext(os.path.basename(pdf_path))[0] + "_変換")
+        os.makedirs(out_dir, exist_ok=True)
+        ui_queue.put(("toast",
+                      f"PDFの変換を開始しました(ページ数により数分かかります):\n"
+                      f"{os.path.basename(pdf_path)}"))
+        log(f"pdf convert start: {pdf_path}")
+        conv_log = os.path.join(out_dir, "変換ログ.txt")
+        with open(conv_log, "w", encoding="utf-8", errors="replace") as lf:
+            result = subprocess.run(
+                [exe, pdf_path, "--output_dir", out_dir, "--output_format", "markdown"],
+                stdout=lf, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+        if result.returncode == 0:
+            winsound.MessageBeep(winsound.MB_OK)
+            ui_queue.put(("toast", "PDFの変換が完了しました。フォルダを開きます"))
+            log(f"pdf convert done: {out_dir}")
+            os.startfile(out_dir)
+        else:
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            ui_queue.put(("toast",
+                          f"PDFの変換に失敗しました。\n詳細: {conv_log}"))
+            log(f"pdf convert failed (exit {result.returncode}): {pdf_path}")
+    except Exception:
+        log("convert_pdf error:\n" + traceback.format_exc())
+        ui_queue.put(("toast", "PDF変換でエラーが発生しました(ocr_tool.log を確認)"))
+    finally:
+        pdf_converting.release()
+
+
 # ---- メモへの追記 ----
 memo_write_lock = threading.Lock()
 
@@ -604,6 +665,9 @@ def setup_tray():
         pystray.MenuItem("メモを開く", open_memo, default=True),
         pystray.MenuItem("フォルダを開く", lambda: os.startfile(BASE_DIR)),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("PDFを丸ごとテキスト化…",
+                         lambda: ui_queue.put(("pdf_dialog", None))),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("高精度モデルを再読み込み", on_reload),
         pystray.MenuItem("GPUメモリを解放(ゲーム前に)", on_release),
         pystray.Menu.SEPARATOR,
@@ -665,6 +729,15 @@ def main():
             log("start_capture failed:\n" + traceback.format_exc())
             ui_queue.put(("toast", "画面の取得に失敗しました。もう一度キーを押してください"))
 
+    def ask_pdf():
+        # ファイル選択ダイアログはtkのメインスレッドで開く必要がある
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="テキスト化するPDFを選択",
+            filetypes=[("PDFファイル", "*.pdf")])
+        if path:
+            threading.Thread(target=convert_pdf, args=(path,), daemon=True).start()
+
     def poll():
         # このループが止まると全ホットキーが無反応になるため、
         # どんなエラーが起きても必ず次回の実行を予約し直す
@@ -673,6 +746,8 @@ def main():
                 kind, payload = ui_queue.get_nowait()
                 if kind == "capture":
                     start_capture(payload)
+                elif kind == "pdf_dialog":
+                    ask_pdf()
                 elif kind == "toast":
                     show_toast(root, payload)
                 elif kind == "quit":

@@ -80,7 +80,30 @@ if ($hasGpu) {
 & $venvPy -c "import onnxruntime, torch, surya, rapid_latex_ocr, winocr, keyboard, pystray, mss, pyperclip; print('check ok / GPU:', torch.cuda.is_available())"
 if ($LASTEXITCODE -ne 0) { throw "動作確認に失敗しました。" }
 
-# ---- 6. 自動起動の登録(任意) ----
+# ---- 6. PDF丸ごと変換機能(任意) ----
+if (-not $NoPrompt) {
+    $ans = Read-Host "PDFを丸ごとテキスト化する機能も入れますか? 追加で約5GBダウンロードします (y/n)"
+    if ($ans -match "^[yY]") {
+        $mvenv = Join-Path $venvRoot "marker_venv"
+        $mpy = Join-Path $mvenv "Scripts\python.exe"
+        if (-not (Test-Path $mpy)) {
+            if ($pyArg) { & $pyExe $pyArg -m venv $mvenv } else { & $pyExe -m venv $mvenv }
+        }
+        Write-Host "PDF変換の部品をダウンロード中(10分前後)..."
+        & $mpy -m pip install --upgrade pip --quiet
+        & $mpy -m pip install "marker-pdf" "surya-ocr>=0.17,<0.18" --quiet
+        if ($hasGpu) {
+            & $mpy -m pip install torch --index-url https://download.pytorch.org/whl/cu126 --upgrade --quiet
+        }
+        if (Test-Path (Join-Path $mvenv "Scripts\marker_single.exe")) {
+            Write-Host "PDF変換機能を導入しました(トレイメニューの「PDFを丸ごとテキスト化…」)"
+        } else {
+            Write-Host "※PDF変換機能の導入に失敗しました(ツール本体はそのまま使えます)"
+        }
+    }
+}
+
+# ---- 7. 自動起動の登録(任意) ----
 if (-not $NoPrompt) {
     $ans = Read-Host "PCを起動したとき、ツールも自動で立ち上げますか? (y/n)"
     if ($ans -match "^[yY]") {
