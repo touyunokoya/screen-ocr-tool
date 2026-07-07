@@ -7,7 +7,7 @@
 終了するときは、画面右下のタスクトレイのアイコンを右クリック →「終了」
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # ============ 設定(ここを書き換えると動作を変えられます) ============
 HOTKEY_TEXT = "ctrl+shift+x"    # 文章認識のショートカットキー
@@ -400,11 +400,22 @@ def process_capture(img, mode):
         if not text:
             ui_queue.put(("toast", "文字を認識できませんでした"))
             return
-        append_to_memo(text, mode)
+        # 先にクリップボードへ。メモへの書き込みが失敗しても認識結果を失わないようにする
         try:
             pyperclip.copy(text)
         except Exception:
             log("clipboard copy failed:\n" + traceback.format_exc())
+        try:
+            append_to_memo(text, mode)
+        except Exception:
+            log("memo append failed:\n" + traceback.format_exc())
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            ui_queue.put(("toast",
+                          "認識はできましたが、メモに書き込めませんでした。\n"
+                          f"保存先: {MEMO_PATH}\n"
+                          "(認識結果はクリップボードにコピー済みです。\n"
+                          " フォルダの場所や、Windowsのランサムウェア防止設定を確認してください)"))
+            return
         winsound.MessageBeep(winsound.MB_OK)
         preview = text if len(text) <= 120 else text[:120] + "…"
         ui_queue.put(("toast", f"メモに追記しました:\n{preview}"))
@@ -514,9 +525,17 @@ def setup_tray():
         else:
             ui_queue.put(("toast", "高精度モデルはすでに停止しています"))
 
+    def open_memo():
+        if os.path.exists(MEMO_PATH):
+            os.startfile(MEMO_PATH)
+        else:
+            # 無反応だと「作られていない」ようにしか見えないので、場所を案内する
+            ui_queue.put(("toast",
+                          "メモはまだ作成されていません(1回認識すると作られます)。\n"
+                          f"保存先: {MEMO_PATH}"))
+
     menu = pystray.Menu(
-        pystray.MenuItem("メモを開く", lambda: os.startfile(MEMO_PATH)
-                         if os.path.exists(MEMO_PATH) else None, default=True),
+        pystray.MenuItem("メモを開く", open_memo, default=True),
         pystray.MenuItem("フォルダを開く", lambda: os.startfile(BASE_DIR)),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("高精度モデルを再読み込み", on_reload),
@@ -590,7 +609,7 @@ def main():
         root.after(80, poll)
 
     poll()
-    log(f"started (v{__version__})")
+    log(f"started (v{__version__}) memo={MEMO_PATH}")
     root.mainloop()
 
 
