@@ -1,4 +1,5 @@
 surya-ocr==0.17.0
+torch==2.12.1
 rapid-latex-ocr==0.0.9
 winocr==0.0.15
 keyboard==0.13.5

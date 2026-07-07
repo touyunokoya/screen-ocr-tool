@@ -7,6 +7,8 @@
 終了するときは、画面右下のタスクトレイのアイコンを右クリック →「終了」
 """
 
+__version__ = "1.1.0"
+
 # ============ 設定(ここを書き換えると動作を変えられます) ============
 HOTKEY_TEXT = "ctrl+shift+x"    # 文章認識のショートカットキー
 HOTKEY_MATH = "ctrl+shift+z"    # 数式認識のショートカットキー
@@ -48,6 +50,9 @@ LOG_PATH = os.path.join(BASE_DIR, "ocr_tool.log")
 
 def log(msg):
     try:
+        # ログが1MBを超えたら古い分を .old に退避(肥大化防止)
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 1_000_000:
+            os.replace(LOG_PATH, LOG_PATH + ".old")
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
     except OSError:
@@ -124,10 +129,21 @@ def recognize_text(img):
     if img.mode != "RGB":
         img = img.convert("RGB")
 
-    async def _run():
-        return await winocr.recognize_pil(img, "ja")
+    async def _run(lang):
+        return await winocr.recognize_pil(img, lang)
 
-    result = asyncio.run(_run())
+    # 日本語OCRが入っていないPC(英語版Windows等)では英語エンジンにフォールバック
+    try:
+        result = asyncio.run(_run("ja"))
+    except Exception:
+        try:
+            result = asyncio.run(_run("en"))
+        except Exception:
+            log("windows OCR unavailable:\n" + traceback.format_exc())
+            if surya_predictors is not None:
+                lines2 = [convert_surya_line(t) for t in surya_run(orig)]
+                return "\n".join(line for line in lines2 if line)
+            raise RuntimeError("OCRエンジンを利用できません(Windowsの言語パックを確認)")
     lines = [clean_japanese_spaces(line.text).strip() for line in result.lines]
     text = "\n".join(line for line in lines if line)
 
@@ -286,7 +302,11 @@ def surya_run(img):
     if img.mode != "RGB":
         img = img.convert("RGB")
     # 2倍に拡大した画像も渡すと小さい文字の認識精度が上がる
-    highres = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+    # (すでに大きい画像は拡大しない: 全画面選択などでのメモリ急増・低速化を防ぐ)
+    if img.width < 2000:
+        highres = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+    else:
+        highres = img
     surya_busy += 1
     try:
         pages = rec([img], det_predictor=det, highres_images=[highres], math_mode=True)
@@ -336,10 +356,10 @@ def recognize_math_surya(img):
 
 
 # ---- メモへの追記 ----
+memo_write_lock = threading.Lock()
+
+
 def append_to_memo(content, kind):
-    if not os.path.exists(MEMO_PATH):
-        with open(MEMO_PATH, "w", encoding="utf-8") as f:
-            f.write("# OCRメモ\n\n")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     if kind == "math":
         body = f"$$\n{content}\n$$"
@@ -350,8 +370,20 @@ def append_to_memo(content, kind):
     else:
         body = content
         label = "文章"
-    with open(MEMO_PATH, "a", encoding="utf-8") as f:
-        f.write(f"## {stamp}({label})\n\n{body}\n\n")
+    # 連続キャプチャ時の書き込み競合を防ぐ + 他アプリがファイルを掴んでいる場合は少し待って再試行
+    with memo_write_lock:
+        for attempt in range(3):
+            try:
+                if not os.path.exists(MEMO_PATH):
+                    with open(MEMO_PATH, "w", encoding="utf-8") as f:
+                        f.write("# OCRメモ\n\n")
+                with open(MEMO_PATH, "a", encoding="utf-8") as f:
+                    f.write(f"## {stamp}({label})\n\n{body}\n\n")
+                return
+            except OSError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.5)
 
 
 # ---- 認識処理(ワーカースレッドで実行) ----
@@ -484,7 +516,7 @@ def setup_tray():
 
     menu = pystray.Menu(
         pystray.MenuItem("メモを開く", lambda: os.startfile(MEMO_PATH)
-                         if os.path.exists(MEMO_PATH) else None),
+                         if os.path.exists(MEMO_PATH) else None, default=True),
         pystray.MenuItem("フォルダを開く", lambda: os.startfile(BASE_DIR)),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("高精度モデルを再読み込み", on_reload),
@@ -558,7 +590,7 @@ def main():
         root.after(80, poll)
 
     poll()
-    log("started")
+    log(f"started (v{__version__})")
     root.mainloop()
 
 
