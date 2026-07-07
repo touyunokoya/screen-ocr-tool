@@ -1,0 +1,9 @@
+surya-ocr==0.17.0
+rapid-latex-ocr==0.0.9
+winocr==0.0.15
+keyboard==0.13.5
+pystray==0.19.5
+pyperclip==1.11.0
+mss==10.2.0
+pillow==10.4.0
+requests==2.34.2
