@@ -7,7 +7,7 @@
 終了するときは、画面右下のタスクトレイのアイコンを右クリック →「終了」
 """
 
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 
 # ============ 設定(ここを書き換えると動作を変えられます) ============
 HOTKEY_TEXT = "ctrl+shift+x"    # 文章認識のショートカットキー
@@ -80,15 +80,67 @@ except OSError:
     ctypes.windll.user32.SetProcessDPIAware()
 
 import tkinter as tk
+from ctypes import wintypes
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 import mss
-import keyboard
 import pyperclip
 import winsound
 import winocr
 import pystray
 
 ui_queue = queue.Queue()
+
+# ---- グローバルホットキー(Win32 RegisterHotKey方式) ----
+# 旧実装(keyboardライブラリの低レベルフック)は、認識処理などでPCが忙しい瞬間に
+# Windowsがフックを黙って解除し、以後キーが他アプリに素通りする問題があった。
+# RegisterHotKeyはOS標準の仕組みでこの問題がなく、他アプリへのキー伝播も防げる。
+_HOTKEY_MODS = {"ctrl": 0x0002, "alt": 0x0001, "shift": 0x0004, "win": 0x0008}
+_MOD_NOREPEAT = 0x4000
+_WM_HOTKEY = 0x0312
+
+
+def parse_hotkey(spec):
+    """'ctrl+shift+x' のような表記を RegisterHotKey 用の (修飾キー, キーコード) に変換"""
+    mods, vk = 0, None
+    for part in spec.lower().split("+"):
+        part = part.strip()
+        if part in _HOTKEY_MODS:
+            mods |= _HOTKEY_MODS[part]
+        elif len(part) == 1:
+            vk = ord(part.upper())
+        elif part.startswith("f") and part[1:].isdigit():
+            vk = 0x70 + int(part[1:]) - 1  # F1〜F24
+        else:
+            raise ValueError(f"対応していないキー表記: {spec}")
+    if vk is None:
+        raise ValueError(f"メインのキーがありません: {spec}")
+    return mods | _MOD_NOREPEAT, vk
+
+
+def hotkey_listener(bindings):
+    """bindings: {登録ID: (キー表記, モード名)}。専用スレッドで実行する"""
+    user32 = ctypes.windll.user32
+    registered = False
+    for hk_id, (spec, _mode) in bindings.items():
+        try:
+            mods, vk = parse_hotkey(spec)
+        except ValueError as e:
+            log(f"hotkey parse error: {e}")
+            continue
+        if user32.RegisterHotKey(None, hk_id, mods, vk):
+            registered = True
+        else:
+            log(f"RegisterHotKey failed: {spec}")
+            ui_queue.put(("toast",
+                          f"ショートカット {spec} を登録できませんでした。\n"
+                          "他のアプリが同じキーを使っている可能性があります"))
+    if not registered:
+        ui_queue.put(("toast", "ショートカットを1つも登録できませんでした(ocr_tool.log を確認)"))
+        return
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+        if msg.message == _WM_HOTKEY and msg.wParam in bindings:
+            ui_queue.put(("capture", bindings[msg.wParam][1]))
 
 # ---- 数式認識モデル(起動後にバックグラウンドで読み込む) ----
 math_model = None
@@ -582,10 +634,11 @@ def main():
     threading.Thread(target=preload_surya, daemon=True).start()
     threading.Thread(target=gpu_monitor, daemon=True).start()
 
-    # suppress=True: 押したキーを他のアプリに渡さない(ブラウザ等のショートカットと衝突しないように)
-    keyboard.add_hotkey(HOTKEY_TEXT, lambda: ui_queue.put(("capture", "text")), suppress=True)
-    keyboard.add_hotkey(HOTKEY_MATH, lambda: ui_queue.put(("capture", "math")), suppress=True)
-    keyboard.add_hotkey(HOTKEY_MIXED, lambda: ui_queue.put(("capture", "mixed")), suppress=True)
+    # OS標準のホットキー登録(登録中は他のアプリにキーが渡らない)
+    bindings = {1: (HOTKEY_TEXT, "text"),
+                2: (HOTKEY_MATH, "math"),
+                3: (HOTKEY_MIXED, "mixed")}
+    threading.Thread(target=hotkey_listener, args=(bindings,), daemon=True).start()
 
     def start_capture(mode):
         if state["selecting"]:
@@ -624,9 +677,8 @@ def main():
                     show_toast(root, payload)
                 elif kind == "quit":
                     tray_icon.stop()
-                    keyboard.unhook_all()
                     root.destroy()
-                    os._exit(0)
+                    os._exit(0)  # ホットキー登録はプロセス終了で自動解除される
         except queue.Empty:
             pass
         except Exception:
